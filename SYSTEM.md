@@ -1,5 +1,5 @@
 # Zero-Count Encoding System (ZCE)
-### Version 1.0 — Full System Blueprint
+### Version 2.0 — Full System Blueprint
 
 ---
 
@@ -7,7 +7,7 @@
 
 This system came from a single intuition: **what if zeros in a bitstream weren't data, but grammar?** Instead of treating every bit as carrying equal weight, what if the *count* of consecutive zeros told you how to read everything that follows — no lookup tables, no external schema, no format specification needed?
 
-That intuition, developed from scratch, produced a complete self-describing binary encoding system, a bytecode format, a compiler, and a virtual machine. This document describes every part of it.
+The idea had been circling for months without a clear form. Then in one session it crystallized: zeros as structural markers, ones as terminators, data completely separated. That intuition, developed from scratch, produced a complete self-describing binary encoding system, a bytecode format, a Turing-complete compiler, and a virtual machine. This document describes every part of it.
 
 ---
 
@@ -19,13 +19,13 @@ In conventional binary, every bit position is equivalent — just a power of 2. 
 - **Ones** terminate zero-sequences. A `1` always ends a grammar token.
 - **Data** lives separately, completely isolated from grammar. It is raw and untouched.
 
-This means the bitstream is divided into two regions:
+The bitstream has three regions:
 
 ```
-[ GRAMMAR SECTION ] 00000000 [ DATA SECTION ]
+[ 16-bit header ] [ GRAMMAR SECTION ] [ DATA SECTION ]
 ```
 
-The grammar section describes structure, instructions, and references. The data section holds raw values. The two never mix, so zeros in your data can never be misread as grammar.
+The 16-bit header stores the exact length of the grammar section in bits. The grammar section describes structure, instructions, and references. The data section holds raw values. The two main sections never mix.
 
 ---
 
@@ -37,329 +37,286 @@ The single primitive of the entire system is the **grammar token**:
 N zeros followed by a terminating 1
 ```
 
-Written as: `000...0001` where the count of zeros is N.
-
-The count N is the entire meaning. No table. No context needed (in Version 1). Just count the zeros, hit the 1, and you know what's coming next.
+The count N is the entire meaning. No table. No context needed. Just count the zeros, hit the 1, and you know what's coming next.
 
 ### Token Table
 
-| Zero Count (N) | Meaning          | Paired? |
-|---------------|------------------|---------|
-| 1             | Value reference  | No      |
-| 2             | Instruction      | No      |
-| 3             | Unit open/close  | Yes     |
-| 4             | Block open/close | Yes     |
-| 5             | Section open/close | Yes   |
-| 7             | Document open/close | Yes  |
+| Zero Count (N) | Meaning               | Paired? |
+|----------------|-----------------------|---------|
+| 1              | Value reference       | No      |
+| 2              | Instruction           | No      |
+| 3              | Unit open/close       | Yes     |
+| 4              | Block open/close      | Yes     |
+| 5              | Section open/close    | Yes     |
+| 6              | Jump-if-false (JIF)   | No      |
+| 7              | Document open/close   | Yes     |
+| 8              | Unconditional jump    | No      |
 
-N=6 and N=8+ are reserved for future use.
-
-**Paired tokens** work like HTML tags — open and close by context. The first occurrence of N=3 opens a unit. The second occurrence of N=3 closes it. Nesting is tracked by a simple stack.
-
----
-
-## The Separator
-
-The grammar and data sections are divided by exactly 8 consecutive zeros:
-
-```
-00000000
-```
-
-This is guaranteed to never appear in the grammar section because:
-- The maximum grammar token length is N=7 (7 zeros + 1)
-- Unary pointers (see below) are encoded as ones followed by a zero — they add no zero-runs
-- Therefore 8 consecutive zeros can only ever be the separator
+**Paired tokens** work like HTML tags — open and close by context. First N=3 opens a unit, second N=3 closes it. Tracked by a simple stack.
 
 ---
 
-## Value References and Unary Pointers
+## The Header
 
-When the decoder encounters N=1 (a value reference token), it immediately reads a **unary pointer** that follows. A unary pointer encodes a data index as:
+The bitstream starts with a **16-bit unsigned integer** representing the exact length of the grammar section in bits:
+
+```
+[ 16 bits: grammar length ] [ grammar bits ] [ data bits ]
+```
+
+The decoder reads the first 16 bits, knows exactly where the grammar ends and data begins, and never needs to scan for a separator pattern. This approach was chosen after an earlier pattern-based separator caused collisions with jump tokens. See BUILDLOG.md for details.
+
+---
+
+## Unary Pointers
+
+When the decoder encounters N=1 (value reference) or a jump token, it reads a **unary pointer**. A unary pointer encodes a data or instruction index as:
 
 ```
 (index + 1) ones, followed by a zero
 ```
 
-Examples:
-- `data[0]` → `10`
-- `data[1]` → `110`
-- `data[2]` → `1110`
-- `data[5]` → `111111 0`
+Examples: `data[0]` → `10`, `data[1]` → `110`, `data[4]` → `111110`
 
-Decoding: count the ones until you hit a zero. That count minus 1 is the index.
+Decoding: count ones until zero. Count minus 1 = index.
 
-This encoding was chosen because unary pointers contain no zero-runs, which means they can never interfere with grammar tokens or the separator. The grammar stream stays completely unambiguous.
+Unary pointers contain **no zeros except the final terminator**, so they can never be misread as grammar tokens.
 
 ---
 
 ## Instructions
 
-When the decoder encounters N=2 (an instruction token), it immediately reads another grammar token whose zero-count identifies the operation:
+When the decoder sees N=2, it reads the next token's zero-count as the instruction code:
 
-| Instruction Zero-Count | Operation |
-|------------------------|-----------|
-| 1                      | ADD       |
-| 2                      | SUB       |
-| 3                      | MUL       |
-| 4                      | STORE     |
-| 5                      | LOAD      |
-| 6                      | PRINT     |
+| N  | Operation | What it does                         |
+|----|-----------|--------------------------------------|
+| 1  | ADD       | data[a] + data[b] → data[c]         |
+| 2  | SUB       | data[a] - data[b] → data[c]         |
+| 3  | MUL       | data[a] * data[b] → data[c]         |
+| 4  | DIV       | data[a] / data[b] → data[c]         |
+| 5  | LOAD      | data[a] → data[b]                   |
+| 6  | PRINT     | output data[a]                       |
+| 7  | CMP_LT    | (data[a] < data[b]) → data[c]      |
+| 8  | CMP_GT    | (data[a] > data[b]) → data[c]      |
+| 9  | CMP_EQ    | (data[a] == data[b]) → data[c]     |
+| 10 | CMP_NEQ   | (data[a] != data[b]) → data[c]     |
+| 11 | CMP_LTE   | (data[a] <= data[b]) → data[c]     |
+| 12 | CMP_GTE   | (data[a] >= data[b]) → data[c]     |
 
-No opcode table is needed. The count of zeros after the instruction marker IS the instruction.
+No opcode table anywhere. The count of zeros IS the operation.
 
-A full instruction in the bitstream looks like:
+---
 
-```
-[N=4 block open] [N=3 unit open]
-  [N=2 instruction marker] [N=K instruction code]
-  [N=1 value ref] [unary pointer]
-  [N=1 value ref] [unary pointer]
-  [N=1 value ref] [unary pointer]   ← result slot
-[N=3 unit close] [N=4 block close]
-```
+## Jump Instructions
+
+Jumps have their own grammar token IDs and do not use the N=2 wrapper.
+
+**Jump-if-false (N=6):** `[N=6] [uptr: cond data idx] [uptr: instr target]`
+If `data[cond] == 0`, jump to instruction at target. Used for if/else and while.
+
+**Unconditional jump (N=8):** `[N=8] [uptr: instr target]`
+Always jump. Used to skip else branches and loop back to while condition.
+
+Targets are **instruction indices**, not bit offsets. The compiler emits JIF/JMP with placeholder targets (0) and **patches** them once the body is fully compiled and the real target is known.
 
 ---
 
 ## The Data Section
 
-The data section is a flat array of 8-bit values (bytes), laid out sequentially after the separator. Each value is stored as exactly 8 raw bits. No encoding, no escaping, no interpretation.
+A flat array of **16-bit unsigned integers** (0–65535). Each stored as 16 raw bits. No encoding, no escaping.
 
-Values are referenced by index via unary pointers in the grammar section. The VM reads and writes data values by index during execution.
-
-Current limitation: values are 8-bit unsigned integers (0–255). Multi-byte values are a planned extension.
+The data array is the program's entire memory — no registers, no stack. A snapshot of the data array at any point is a complete picture of program state.
 
 ---
 
-## A Complete Worked Example
+## Worked Example — `x = 3 + 5; print x`
 
-**Source program:**
+**Compiled instruction list:**
 ```
-x = 3 + 5
+0: ADD   data[0], data[1] → data[2]   (3+5 → result)
+1: LOAD  data[2] → data[3]            (result → x)
+2: PRINT data[3]                       (print x)
 ```
-
-**Compilation steps:**
-1. Literal `3` → stored in data[0]
-2. Literal `5` → stored in data[1]
-3. Result slot for ADD → data[2] (initialized to 0)
-4. Variable `x` → data[3] (initialized to 0)
-5. Emit: ADD(data[0], data[1], data[2])
-6. Emit: LOAD(data[2], data[3])
 
 **Data section:**
 ```
-[3, 5, 0, 0]
-= 00000011 00000101 00000000 00000000
+data[0]=3  data[1]=5  data[2]=0(result)  data[3]=0(x)
 ```
 
-**Grammar section (annotated):**
-```
-0000000 1    ← document open  (N=7)
-00000 1      ← section open   (N=5)
-
-  00001      ← block open     (N=4)
-  0001       ← unit open      (N=3)
-    001      ← instruction    (N=2)
-    01       ← ADD            (N=1)
-    01       ← value ref      (N=1)
-    10       ← unary ptr → data[0] = 3
-    01       ← value ref      (N=1)
-    110      ← unary ptr → data[1] = 5
-    01       ← value ref      (N=1)
-    1110     ← unary ptr → data[2] = result slot
-  0001       ← unit close     (N=3)
-  00001      ← block close    (N=4)
-
-  00001      ← block open     (N=4)
-  0001       ← unit open      (N=3)
-    001      ← instruction    (N=2)
-    00001    ← LOAD           (N=5)
-    01       ← value ref      (N=1)
-    1110     ← unary ptr → data[2]
-    01       ← value ref      (N=1)
-    11110    ← unary ptr → data[3]
-  0001       ← unit close     (N=3)
-  00001      ← block close    (N=4)
-
-00000 1      ← section close  (N=5)
-0000000 1    ← document close (N=7)
-
-00000000     ← SEPARATOR
-
-00000011 00000101 00000000 00000000   ← data: [3, 5, 0, 0]
-```
-
-**Execution:**
-- ADD: data[0] + data[1] → data[2] (3 + 5 = 8)
-- LOAD: data[2] → data[3] (x = 8)
+**Execution:** ADD produces 8 in data[2], LOAD copies to data[3], PRINT outputs 8.
 
 ---
 
-## The Decoder Algorithm
-
-The entire decoder is a single loop with one rule:
+## Worked Example — while loop
 
 ```
-loop:
-  count consecutive zeros → N
-  consume the terminating 1
-  
-  if N == 7: toggle document context
-  if N == 5: toggle section context
-  if N == 4: toggle block context (on close, commit current instruction)
-  if N == 3: toggle unit context
-  if N == 2: read next token as instruction code
-  if N == 1: read unary pointer, look up data value
-  
-  repeat
+i = 1
+s = 0
+while i <= 10:
+    s = s + i
+    i = i + 1
+print s
 ```
 
-No tables. No branches on opcode values. No external specification needed. The bitstream is fully self-describing — any decoder that knows these 7 rules can read any ZCE bitstream ever produced.
+**Instruction list with jumps:**
+```
+0:  LOAD lit(1) → i
+1:  LOAD lit(0) → s
+2:  CMP_LTE i, lit(10) → cond     ← loop top
+3:  JIF cond → 10                  ← exit if false
+4:  ADD s, i → tmp
+5:  LOAD tmp → s
+6:  ADD i, lit(1) → tmp
+7:  LOAD tmp → i
+8:  JMP → 2                        ← back to loop top
+9:  PRINT s                        ← after loop
+```
+
+The compiler emits JIF at step 3 with target=0, compiles the body (steps 4-8), emits JMP back to 2, then patches JIF's target to 9 (after loop).
 
 ---
 
-## The Compiler (ZC-Lang v1)
-
-ZC-Lang is a minimal source language that compiles to ZCE bytecode. Version 1 supports:
-
-- Integer literals: `3`, `42`, `255`
-- Variables: `x`, `result`, any alphanumeric name
-- Arithmetic: `+`, `-`, `*`
-- Assignment: `x = expr`
-- Output: `print x`
-- Chained operations: `y = x * 2`
-
-**Example programs:**
+## Decoder Algorithm
 
 ```
-# Basic arithmetic
-x = 3 + 5
-print x
-# output: 8
+read 16 bits → grammar_length
+grammar = bitstream[16 : 16+grammar_length]
+data    = bitstream[16+grammar_length:]  (16-bit chunks)
+
+pos = 0
+while pos < len(grammar):
+    count zeros → N
+    consume terminating 1
+
+    N=7 → toggle document context
+    N=5 → toggle section context
+    N=4 → toggle block context; on close: commit instruction
+    N=3 → toggle unit context
+    N=8 → read uptr → emit JMP
+    N=6 → read uptr(cond) + uptr(target) → emit JIF
+    N=2 → read next N → instruction name
+    N=1 → read uptr → append data index to current instruction
 ```
 
-```
-# Chain of operations
-x = 3 + 5
-y = x * 2
-print y
-# output: 16
-```
+---
+
+## Compiler Pipeline
 
 ```
-# Multiple variables
-a = 10 + 5
-b = a - 3
-c = b * 4
-print a
-print b
-print c
-# output: 15, 12, 48
-```
-
-**Compilation pipeline:**
-
-```
-Source text
-    ↓  Lexer (split lines, identify tokens)
-    ↓  Parser (assign = expr, print stmt)
-    ↓  Code generator (allocate data slots, emit instructions)
-    ↓  Encoder (grammar tokens + data section)
+Source (ZC-Lang)
+  → Line scanner (strips comments/blanks)
+  → Statement parser (assign / print / if / while)
+  → Expression compiler (arithmetic → data slots + instructions)
+  → Condition compiler (comparisons → CMP instruction + result slot)
+  → Block finder (indentation-based sub-block extraction)
+  → Jump emitter + forward patcher
+  → Encoder (wrap in block/unit tokens, prepend header, append data)
 ZCE Bitstream
-    ↓  Decoder (count zeros, resolve pointers)
-    ↓  VM (execute instruction list against data array)
+  → Decoder (header → grammar → data)
+  → VM (PC-based executor over instruction list)
 Output
 ```
 
 ---
 
-## The Virtual Machine
-
-The VM is a simple interpreter that operates on a flat data array:
+## VM
 
 ```
-for each instruction:
-  ADD   data[a] + data[b] → data[c]
-  SUB   data[a] - data[b] → data[c]
-  MUL   data[a] * data[b] → data[c]
-  LOAD  data[a] → data[b]
-  PRINT output data[a]
+pc = 0
+while pc < len(ops):
+    execute ops[pc]
+    JMP/JIF: set pc = target, continue
+    else: pc += 1
 ```
 
-No registers. No stack. All state lives in the data array. This is intentional — the data section of the bytecode IS the memory of the program.
+Max step limit prevents infinite loops in runaway programs.
+
+---
+
+## ZC-Lang v2 Language
+
+```python
+# arithmetic
+x = 3 + 5
+y = x * 2
+z = y / 4
+
+# conditionals
+if x > 5:
+    result = 1
+else:
+    result = 0
+
+# loops
+while i < 10:
+    i = i + 1
+
+# output
+print x
+```
+
+**Operators:** `+` `-` `*` `/` `==` `!=` `<` `>` `<=` `>=`
+**Data:** 16-bit unsigned integers (0–65535)
+**Limits:** one operator per expression, no functions, no strings
+
+---
+
+## Test Results
+
+23/23 tests passing including: factorial(5)=120, fibonacci(10th)=55, sum 1-10=55, power of 2 loop (2^8=256), nested if-in-while, absolute difference, max of two numbers.
 
 ---
 
 ## What Makes This Different
 
-| Property | ZCE | JVM Bytecode | x86 | Protobuf |
-|----------|-----|-------------|-----|----------|
-| Self-describing | Yes — fully | No — needs JVM spec | No | No — needs .proto file |
-| Decoder size | ~50 lines | Thousands | Millions | Hundreds |
-| External schema needed | No | Yes | Yes | Yes |
-| Variable-length instructions | Yes — naturally | Partial | Partial | Yes |
-| Grammar is table-free | Yes | No | No | No |
-
-The key differentiator: **ZCE bitstreams carry their own complete grammar.** Any decoder anywhere that knows the 7 token rules can decode any ZCE bitstream without any external document, schema, or specification.
+| Property | ZCE v2 | JVM | x86 | Protobuf |
+|----------|--------|-----|-----|----------|
+| Self-describing | Yes | No | No | No |
+| Needs external spec | No | Yes | Yes | Yes |
+| Decoder size | ~80 lines | Thousands | Millions | Hundreds |
+| Table-free grammar | Yes | No | No | No |
+| Turing complete | Yes | Yes | Yes | No |
 
 ---
 
-## Current Limitations (V1)
+## Limitations (V2)
 
-- Values are 8-bit only (0–255)
-- No conditionals (if/else)
-- No loops
+- One operator per expression
 - No functions
-- No negative numbers
-- Unary pointers become long for large data arrays (data[100] = 101 ones)
-- Grammar overhead is significant at small scale
+- No strings or floats
+- No negative literals
+- Unary pointers grow linearly (data[100] = 101 bits)
+- Overhead large at small scale
 
 ---
 
-## Planned Extensions (V2 and beyond)
+## Planned (V3)
 
-**Conditionals** — N=6 token as if/else marker:
-```
-if x > 0:
-    y = x + 1
-```
-
-**Loops** — N=9 token as loop marker
-
-**Functions** — N=10 token as function definition/call
-
-**16-bit and 32-bit values** — extend data section to support wider types
-
-**Compressed pointers** — replace unary pointers with fixed-width or Elias-coded pointers for large data arrays
-
-**Mode shifting** — use a special token to switch data interpretation (unicode text, float, etc.)
-
-**Turing completeness** — adding conditionals and loops makes ZCE Turing complete, meaning it can express any computation
+- Functions (N=9 token)
+- Elias-coded pointers (compact large indices)
+- 32-bit data
+- Negative numbers
+- Compound expressions
 
 ---
 
-## File Reference
+## Files
 
 | File | Description |
 |------|-------------|
-| `zerocount.py` | Core encoder/decoder for ZCE bytecode with tests |
-| `zclang.py` | ZC-Lang compiler + VM (full pipeline source → output) |
+| `zerocount.py` | Core encoder/decoder v1 |
+| `zclang_v2.py` | Full compiler + VM, 23 tests |
 | `SYSTEM.md` | This document |
+| `BUILDLOG.md` | Development log, bugs, decisions |
 
 ---
 
 ## Summary
 
-Zero-Count Encoding is a binary format where:
+Zero-Count Encoding is a binary format where consecutive zeros are the only grammar primitive, the count determines meaning without any table, data is separated from grammar via a length header, and any decoder knowing the token rules can read any ZCE bitstream without external specification.
 
-1. Consecutive zeros are the only grammar primitive
-2. The count of zeros determines meaning — no tables
-3. Data is completely separated from grammar
-4. Any decoder knowing 7 rules can read any bitstream
-5. A working compiler and VM exist for version 1
-
-It is not better than JVM or x86 today. It is a clean, minimal foundation — built in one day from a raw intuition about bits — with a genuinely novel property: **total self-description with zero external dependencies.**
+Built in one day from a raw intuition about bits.
 
 ---
 
-*ZCE v1 — conceived and developed March 2026*
+*ZCE v2 — conceived and developed March 1, 2026*
