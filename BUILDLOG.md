@@ -500,3 +500,177 @@ Real programs (4/4): bubble sort (8 elements sorted correctly), primes to 50 (al
 ---
 
 *V3 build log entry — March 1, 2026*
+
+---
+
+## Part 7 — V4: Elias Gamma Coding + Arrays
+
+### Goals
+
+Two additions: replace fixed-16-bit data section with Elias gamma coded values, and add a real array type with indexing, length, and array-passing to functions.
+
+---
+
+### Elias Gamma Coding
+
+**The problem with fixed-16:** Every value in the data section took exactly 16 bits regardless of its actual size. A program full of small values like 0, 1, 2, 3 was paying the same cost as a program using 60000. Almost all real programs are dominated by small values — loop counters, boolean flags, intermediate results. The waste was large.
+
+**Elias gamma encoding:** Encode positive integer N as floor(log2(N)) leading zeros, followed by N written in binary. Self-delimiting: the decoder counts leading zeros to know how many bits to read. To handle zero, we store value+1.
+
+Savings vs fixed-16:
+```
+value=0   →  1 bit  (was 16, saving 15)
+value=1   →  3 bits (was 16, saving 13)
+value=7   →  7 bits (was 16, saving  9)
+value=63  → 13 bits (was 16, saving  3)
+value=100 → 13 bits (was 16, saving  3)
+value=255 → 17 bits (was 16, costing  1)  ← crossover point
+value=1000→ 19 bits (was 16, costing  3)
+```
+
+Break-even is around 200. Values above that cost more bits than fixed-16. For typical programs dominated by small values, overall data section shrinks by 80–90%.
+
+**Where to apply it:** Only the DATA SECTION. Grammar tokens (unary pointers, ztok sequences) stay unchanged. Why? Because grammar tokens are parsed by zero-count scanning — any encoding that starts with zeros would be ambiguous with grammar tokens. Elias gamma starts with leading zeros, so it cannot safely live inside the grammar stream without a protocol change. Data section is parsed separately after the grammar, so it can use any self-delimiting encoding freely.
+
+**Header change:** The header grew from one field to two. Previously: `[16-bit grammar length]`. Now: `[16-bit grammar length][16-bit data count]`. The data count is needed because Elias values are variable-length — the decoder must know how many values to read, otherwise it can't know when the data section ends.
+
+**Correctness tests:** Ran arithmetic with small numbers, large numbers (1000+2000=3000), and recursive factorial(7)=5040. All correct. The Elias encode/decode round-trips perfectly.
+
+---
+
+### Arrays
+
+**Design:** Arrays are a runtime structure separate from the scalar data section. The scalar data section stores an array's ID (an integer index into a runtime array table). Instructions operate on this ID to read, write, and query the array.
+
+Four new instruction codes:
+```
+N=14  ARR_NEW  size_slot, result_slot   → creates array, stores ID in result_slot
+N=15  ARR_GET  arr_slot, idx_slot, result_slot
+N=16  ARR_SET  arr_slot, idx_slot, val_slot
+N=17  ARR_LEN  arr_slot, result_slot
+```
+
+All reuse the N=2 instruction wrapper — no new grammar token needed.
+
+**Syntax added:**
+```
+arr = array(10)      → ARR_NEW
+x   = arr[i]        → ARR_GET
+arr[i] = x          → ARR_SET
+n   = len(arr)      → ARR_LEN
+```
+
+Arrays are passed to functions by value — the array ID (an integer) is passed as a normal parameter. Since the runtime array table is global, the function operates on the same underlying array. This is reference semantics by accident, which is actually the right behavior.
+
+---
+
+### Bug 9: elif exclusion in `_stmt`
+
+**Problem:** The statement parser used an `elif` chain:
+```python
+elif "[" in s and "=" in s and not comparisons:
+    bracket = s.index("[")
+    eq      = s.index("=")
+    if bracket < eq:
+        ... array set ...
+        return i+1
+elif "=" in s and not comparisons:
+    ... regular assignment ...
+```
+
+For `x = arr[0]`, both outer conditions are true: `[` is in the string, `=` is in the string. The first `elif` matches. But then the inner `if bracket < eq` is false (bracket=7, eq=2, 7 > 2). So array-set is skipped. But because the first `elif` already matched and its body ran without returning, execution fell through to the next statement — and the regular assignment `elif` was **never evaluated** because `elif` is exclusive. `x = arr[0]` silently did nothing.
+
+**Symptom:** Every array read returned 0. Array writes worked fine (they match bracket < eq). Only reads were broken.
+
+**Fix:** Merged both assignment cases under a single `elif "=" in s` check. Inside, detect array-set by checking whether the left-hand side contains `[`. This way both cases always evaluate; the array-set check is just a conditional inside the assignment handler rather than a competing `elif`.
+
+```python
+elif "=" in s and not comparisons:
+    lhs = s[:eq].strip()
+    rhs = s[eq+1:].strip()
+    if "[" in lhs and lhs.endswith("]"):
+        # array set
+    else:
+        # regular assignment
+```
+
+This is the only bug in v4. One structural mistake in the elif chain affected every array read in every program.
+
+---
+
+### Test Results
+
+**Elias correctness (3/3):** Basic arithmetic, large numbers (3000), recursive factorial (5040). All correct — encoding and decoding round-trip cleanly.
+
+**Array operations (8/8):** Create and read, `len()`, fill with loop, sum elements, find maximum, reverse, bubble sort using `arr[j]` notation, function taking an array as parameter. All correct.
+
+**Benchmarks (4/4):**
+
+| Program | ZCE | Python co_code | Python marshal | vs co_code | vs marshal |
+|---------|-----|----------------|----------------|------------|------------|
+| Bubble sort (array) | 573B | 192B | 491B | 2.98x | 1.17x |
+| Primes sieve | 328B | 204B | 481B | 1.61x | 0.68x |
+| Fibonacci recursive | 151B | 138B | 405B | 1.10x | 0.37x |
+| GCD Euclidean | 126B | 130B | 409B | **0.97x** | 0.31x |
+
+**Reading the numbers:**
+
+GCD is now smaller than Python's raw bytecode (0.97x). That is a meaningful result. ZCE with Elias coding beats Python's pure instruction bytes on a function-heavy numeric program. Python's co_code is heavily optimized by CPython's compiler — beating it at all is not a given.
+
+Fibonacci is nearly tied with Python co_code (1.10x) while being 2.7x smaller than the full .pyc file.
+
+Bubble sort ZCE is still larger. The gap is real and explained: Python uses `BINARY_SUBSCR` / `STORE_SUBSCR` as single compact instructions operating on a list object. ZCE expands each array access into ARR_GET/ARR_SET with three argument slots, each paying the unary pointer overhead. The unary pointer for slot indices ≥ 10 starts to hurt. This is where Elias-coded grammar pointers (not just data values) would help — but that requires a grammar format change, saved for v5.
+
+**Total: 15/15** — all tests passing.
+
+---
+
+## V4 Final Token Table
+
+| N (zero count) | Grammar meaning |
+|----------------|-----------------|
+| 1  | Value reference (unary pointer follows) |
+| 2  | Instruction (instruction code token follows) |
+| 3  | Unit open/close |
+| 4  | Block open/close |
+| 5  | Section open/close |
+| 6  | Jump-if-false |
+| 7  | Document open/close |
+| 8  | Unconditional jump |
+| 10 | CALL |
+| 11 | RET |
+| 12 | FUNC |
+
+## V4 Instruction Codes
+
+| N | Instruction | Operation |
+|---|-------------|-----------|
+| 1  | ADD     | a + b → c |
+| 2  | SUB     | a - b → c |
+| 3  | MUL     | a * b → c |
+| 4  | DIV     | a / b → c (integer) |
+| 5  | LOAD    | a → b |
+| 6  | PRINT   | output a |
+| 7  | CMP_LT  | a < b → c |
+| 8  | CMP_GT  | a > b → c |
+| 9  | CMP_EQ  | a == b → c |
+| 10 | CMP_NEQ | a != b → c |
+| 11 | CMP_LTE | a <= b → c |
+| 12 | CMP_GTE | a >= b → c |
+| 13 | MOD     | a % b → c |
+| 14 | ARR_NEW | create array of size a, store ID in b |
+| 15 | ARR_GET | arrays[a][b] → c |
+| 16 | ARR_SET | arrays[a][b] = c |
+| 17 | ARR_LEN | len(arrays[a]) → b |
+
+## Bitstream Format (V4)
+
+```
+[16-bit grammar length] [16-bit data count] [grammar bits] [Elias-coded data values]
+```
+
+Data values encoded as Elias gamma with +1 offset (supports zero).
+
+---
+
+*V4 build log entry — March 2, 2026*
